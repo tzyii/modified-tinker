@@ -188,13 +188,17 @@ c
       implicit none
       integer i,j,k,iter
       integer maxiter
+      integer guess_iter
       real*8 polmin
       real*8 eps,epsold
       real*8 epsd,epsp
       real*8 udsum,upsum
       real*8 a,ap,b,bp
       real*8 sum,sump
+      real*8 guess_thres,guess_err,tdip_var,adip_var,dipdamp
       real*8, allocatable :: poli(:)
+      real*8, allocatable :: uind_old(:,:)
+      real*8, allocatable :: uinp_old(:,:)
       real*8, allocatable :: field(:,:)
       real*8, allocatable :: fieldp(:,:)
       real*8, allocatable :: rsd(:,:)
@@ -207,6 +211,7 @@ c
       real*8, allocatable :: vecp(:,:)
       real*8, allocatable :: usum(:,:)
       real*8, allocatable :: usump(:,:)
+      logical guess_done
       logical done
       character*6 mode
 c
@@ -236,7 +241,7 @@ c
          call dfield0a (field,fieldp)
       end if
 c
-c     set induced dipoles to polarizability times direct field
+c     set direct induced dipoles to polarizability times direct field
 c
       do i = 1, npole
          if (douind(ipole(i))) then
@@ -248,6 +253,102 @@ c
             end do
          end if
       end do
+c
+c     Iteritive method to calculate induced dipole
+c
+c        set induced dipoles to direct times 0.5
+c
+      if (poltyp .eq. 'MUTUAL' .and. .not. use_pred
+     &    .and. .not. use_ielscf) then
+         allocate (uind_old(3,npole))
+         allocate (uinp_old(3,npole))
+
+         do i = 1, npole
+            if (douind(ipole(i))) then
+               do j = 1, 3
+                  uind(j,i) = udir(j,i) * 0.5d0
+                  uinp(j,i) = udirp(j,i) * 0.5d0
+               end do
+            else
+               do j = 1, 3
+                  uind_old(j,i) = 0.0d0
+                  uinp_old(j,i) = 0.0d0
+               end do
+            end if
+         end do
+c
+c        get induced dipoles via iterations
+c
+         guess_done = .false.
+         guess_thres = 0.00001
+         guess_iter = 0
+         dipdamp = 0.8d0
+         do while (.not. guess_done)
+            guess_iter = guess_iter + 1
+            do i = 1, npole
+               if (douind(ipole(i))) then
+                  do j = 1, 3
+                     uind_old(j,i) = uind(j,i)
+                     uinp_old(j,i) = uinp(j,i)
+                  end do
+               end if
+            end do
+            if (use_ewald) then
+               call ufield0c (field,fieldp)
+            else if (use_mlist) then
+               call ufield0b (field,fieldp)
+            else
+               call ufield0a (field,fieldp)
+            end if
+            guess_err = 0.0d0
+            tdip_var = 0.0d0
+            do i = 1, npole
+               if (douind(ipole(i))) then
+                  adip_var = 0.0d0
+                  do j = 1, 3
+                     uind(j,i) = polarity(i) * field(j,i)
+     &                          + udir(j,i)
+                     uinp(j,i) = polarity(i) * fieldp(j,i)
+     &                          + udirp(j,i)
+                     uind(j,i) = dipdamp * (uind_old(j,i) - uind(j,i))
+     &                          + uind(j,i)
+                     uinp(j,i) = dipdamp * (uinp_old(j,i) - uinp(j,i))
+     &                          + uinp(j,i)
+                     adip_var = (uind(j,i) - uind_old(j,i))**2
+     &                          + adip_var
+                  end do
+                  adip_var = sqrt(adip_var)
+                  tdip_var = tdip_var + adip_var
+                  if (adip_var .gt. guess_err) then
+                     guess_err = adip_var
+                  end if
+               end if
+            end do
+            tdip_var = tdip_var * debye
+            guess_err = guess_err * debye
+            if (guess_err .lt. guess_thres) then
+               guess_done = .true.
+            else if (guess_iter .ge. politer) then
+               guess_done = .true.
+            else if (guess_err .lt. 0.01d0
+     &         .and. dipdamp .gt. 0.5d0) then
+               dipdamp = 0.5d0
+            end if
+         end do
+
+         deallocate (uind_old)
+         deallocate (uinp_old)
+c
+c        if not converged
+c
+         if (guess_iter.ge.politer .and. guess_err.ge.guess_thres) then
+            write (iout,45)
+   45       format (/,' INDUCE  --  Warning, Induced Dipoles',
+     &                ' are not Converged')
+            call prterr
+            call fatal
+         end if
+      end if
 c
 c     get induced dipoles via the OPT extrapolation method
 c
@@ -491,15 +592,8 @@ c
             epsold = eps
             eps = max(epsd,epsp)
             eps = debye * sqrt(eps/dble(npolar))
-            if (debug) then
-               if (iter .eq. 1) then
-                  write (iout,10)
-   10             format (/,' Determination of SCF Induced Dipole',
-     &                       ' Moments :',
-     &                    //,4x,'Iter',7x,'RMS Residual (Debyes)',/)
-               end if
-               write (iout,20)  iter,eps
-   20          format (i8,7x,f16.10)
+            if (iter .eq. 1) then
+               done = .true.
             end if
             if (eps .lt. poleps)  done = .true.
             if (eps .gt. epsold)  done = .true.
@@ -541,7 +635,7 @@ c
 c
 c     terminate the calculation if dipoles failed to converge
 c
-         if (iter.ge.maxiter .or. eps.gt.epsold) then
+         if (iter.ge.politer) then
             write (iout,40)
    40       format (/,' INDUCE  --  Warning, Induced Dipoles',
      &                 ' are not Converged')
